@@ -1,0 +1,193 @@
+<#
+.SYNOPSIS
+    Exports all ENABLED (not disabled) computer accounts from Active Directory to an Excel file,
+    including last contact time (LastLogonDate) and basic OS/location info.
+
+.DESCRIPTION
+    - Pulls every computer object in the domain where Enabled = $true (i.e. NOT deactivated/disabled).
+    - Reports LastLogonDate as the "last contacted" time. This comes from the replicated
+      lastLogonTimestamp attribute, which can lag up to ~14 days behind the true last logon
+      (that's a built-in AD replication design, not a bug). It's still the standard, fast way
+      to answer "is this machine still alive" without hammering every DC.
+    - Flags computers that haven't been seen in a while (default: 90+ days) so stale/dead
+      machines are easy to spot in the spreadsheet.
+    - Does NOT include "last logged on user" — Active Directory does not store that on the
+      computer object at all. Getting that reliably would require either live-querying every
+      machine over the network (slow, only works if the PC is online) or a tool like SCCM/MECM.
+      Ask me if you want that version of the script instead.
+
+.NOTES
+    Run this ON a Domain Controller, or on any machine that has the "Active Directory module
+    for Windows PowerShell" (RSAT-AD-PowerShell) installed, while logged in as a user with
+    rights to read computer objects (any domain user can read this by default).
+
+    To install RSAT on a DC if the module is somehow missing:
+        Install-WindowsFeature RSAT-AD-PowerShell
+
+.PARAMETER OutputFolder
+    Folder to save the spreadsheet in. Defaults to C:\temp (created automatically if missing).
+
+.PARAMETER StaleDays
+    Computers whose LastLogonDate is older than this many days get flagged/highlighted
+    as likely inactive/offline. Defaults to 90.
+
+.EXAMPLE
+    .\Get-ActiveADComputers.ps1
+    .\Get-ActiveADComputers.ps1 -OutputFolder "C:\temp" -StaleDays 60
+#>
+
+[CmdletBinding()]
+param(
+    [string]$OutputFolder = "C:\temp",
+    [int]$StaleDays = 90
+)
+
+$ErrorActionPreference = "Stop"
+
+function Write-Info($msg)  { Write-Host "[*] $msg" -ForegroundColor Cyan }
+function Write-Ok($msg)    { Write-Host "[OK] $msg" -ForegroundColor Green }
+function Write-Warn2($msg) { Write-Host "[!] $msg" -ForegroundColor Yellow }
+
+# ---------------------------------------------------------------------------
+# 1. Make sure the ActiveDirectory module is available
+# ---------------------------------------------------------------------------
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    Write-Warn2 "The ActiveDirectory PowerShell module isn't installed on this machine."
+    Write-Warn2 "On a Domain Controller, run this first (as Administrator), then re-run this script:"
+    Write-Warn2 "    Install-WindowsFeature RSAT-AD-PowerShell"
+    throw "ActiveDirectory module not found."
+}
+
+Import-Module ActiveDirectory -ErrorAction Stop
+
+# ---------------------------------------------------------------------------
+# 2. Make sure the output folder exists
+# ---------------------------------------------------------------------------
+if (-not (Test-Path -LiteralPath $OutputFolder)) {
+    Write-Info "Creating output folder: $OutputFolder"
+    New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+# 3. Pull all ENABLED computer accounts
+# ---------------------------------------------------------------------------
+Write-Info "Querying Active Directory for enabled computer accounts..."
+
+$properties = @(
+    'Name',
+    'DNSHostName',
+    'Enabled',
+    'OperatingSystem',
+    'OperatingSystemVersion',
+    'LastLogonDate',
+    'whenCreated',
+    'DistinguishedName',
+    'IPv4Address'
+)
+
+$computers = Get-ADComputer -Filter 'Enabled -eq $true' -Properties $properties
+
+Write-Ok "Found $($computers.Count) enabled computer account(s)."
+
+if ($computers.Count -eq 0) {
+    Write-Warn2 "No enabled computers found - nothing to export."
+    return
+}
+
+# ---------------------------------------------------------------------------
+# 4. Shape the data for the spreadsheet
+# ---------------------------------------------------------------------------
+$now = Get-Date
+$staleCutoff = $now.AddDays(-$StaleDays)
+
+$rows = foreach ($c in $computers) {
+
+    # Pull the OU path out of the DN for a human-readable "location" column
+    $ouPath = ($c.DistinguishedName -replace '^CN=[^,]+,', '')
+
+    $daysSinceContact = if ($c.LastLogonDate) {
+        [math]::Round(($now - $c.LastLogonDate).TotalDays, 1)
+    } else {
+        $null
+    }
+
+    $status = if (-not $c.LastLogonDate) {
+        "Never contacted / unknown"
+    } elseif ($c.LastLogonDate -lt $staleCutoff) {
+        "Stale (>{0} days)" -f $StaleDays
+    } else {
+        "Active"
+    }
+
+    [PSCustomObject]@{
+        ComputerName          = $c.Name
+        DNSHostName           = $c.DNSHostName
+        Enabled               = $c.Enabled
+        OperatingSystem       = $c.OperatingSystem
+        OperatingSystemVersion= $c.OperatingSystemVersion
+        LastContacted         = $c.LastLogonDate
+        DaysSinceLastContact  = $daysSinceContact
+        Status                = $status
+        WhenCreated           = $c.whenCreated
+        OU                    = $ouPath
+    }
+}
+
+$rows = $rows | Sort-Object LastContacted -Descending
+
+# ---------------------------------------------------------------------------
+# 5. Export to Excel (falls back to CSV if the ImportExcel module can't be installed)
+# ---------------------------------------------------------------------------
+$timestamp  = Get-Date -Format "yyyyMMdd_HHmm"
+$xlsxPath   = Join-Path $OutputFolder "ActiveADComputers_$timestamp.xlsx"
+$csvPath    = Join-Path $OutputFolder "ActiveADComputers_$timestamp.csv"
+
+$haveImportExcel = $true
+if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+    Write-Info "The 'ImportExcel' module isn't installed - attempting to install it from PSGallery..."
+    try {
+        Install-Module -Name ImportExcel -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+        Write-Ok "ImportExcel module installed."
+    } catch {
+        Write-Warn2 "Couldn't install ImportExcel (no internet access to PSGallery from this server?)."
+        Write-Warn2 "Falling back to CSV export instead. Error: $($_.Exception.Message)"
+        $haveImportExcel = $false
+    }
+}
+
+if ($haveImportExcel) {
+    Import-Module ImportExcel -ErrorAction Stop
+
+    $rows |
+        Export-Excel -Path $xlsxPath `
+            -WorksheetName "Active Computers" `
+            -AutoSize `
+            -FreezeTopRow `
+            -BoldTopRow `
+            -TableName "ActiveComputers" `
+            -TableStyle Medium2 `
+            -ConditionalText $(
+                New-ConditionalText -Text "Stale" -ConditionalTextColor DarkRed -BackgroundColor LightPink
+                New-ConditionalText -Text "Never contacted" -ConditionalTextColor DarkRed -BackgroundColor LightPink
+                New-ConditionalText -Text "Active" -ConditionalTextColor DarkGreen -BackgroundColor LightGreen
+            )
+
+    Write-Ok "Spreadsheet saved to: $xlsxPath"
+} else {
+    $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    Write-Ok "CSV saved to: $csvPath (rename/open in Excel and 'Save As' .xlsx if needed)"
+}
+
+# ---------------------------------------------------------------------------
+# 6. Quick summary to the console
+# ---------------------------------------------------------------------------
+$staleCount = ($rows | Where-Object { $_.Status -like "Stale*" }).Count
+$neverCount = ($rows | Where-Object { $_.Status -eq "Never contacted / unknown" }).Count
+
+Write-Host ""
+Write-Host "Summary" -ForegroundColor White
+Write-Host "-------"
+Write-Host "Total enabled computers : $($rows.Count)"
+Write-Host "Stale (>$StaleDays days)     : $staleCount"
+Write-Host "Never contacted        : $neverCount"
+Write-Host ""
